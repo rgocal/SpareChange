@@ -1,0 +1,16 @@
+[versions]
+
+agp = "9.1.1"
+kotlin = "2.3.21"
+
+billing = "8.3.0"
+
+[libraries]
+
+billing = { group = "com.android.billingclient", name = "billing", version.ref = "billing" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+
