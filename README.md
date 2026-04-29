@@ -26,7 +26,7 @@ Java Version Required : Version 17
 
 Local Installatiohn : include(":SpareChange")
 ```
-implementation 'com.github.rgocal:SpareChange:master-SNAPSHOT'
+implementation 'com.github.rgocal:SpareChange:1'
 ```
 
 Initialization
