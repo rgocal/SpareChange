@@ -10,6 +10,10 @@ android {
         }
     }
 
+    publishing {
+        singleVariant("release")
+    }
+
     defaultConfig {
         minSdk = 29
         consumerProguardFiles("consumer-rules.pro")
