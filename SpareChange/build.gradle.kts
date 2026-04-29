@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.gocalsd.sparechange"
-    compileSdk = 36
+    compileSdk = 35
 
     publishing {
         singleVariant("release") {
@@ -35,14 +35,14 @@ android {
 }
 
 afterEvaluate {
-    configure<PublishingExtension> {
+    publishing {
         publications {
             register<MavenPublication>("release") {
                 from(components["release"])
                 
                 groupId = "com.github.rgocal"
                 artifactId = "SpareChange"
-                version = "1.0.0"
+                version = "1.0.1"
             }
         }
     }
