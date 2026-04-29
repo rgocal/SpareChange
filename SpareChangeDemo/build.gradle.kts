@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "com.gocalsd.sparechange"
+    namespace = "com.gocalsd.sparechange.demo"
     compileSdk {
         version = release(36) {
             minorApiLevel = 1
