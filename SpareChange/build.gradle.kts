@@ -1,14 +1,11 @@
 plugins {
     alias(libs.plugins.android.library)
+    `maven-publish`
 }
 
 android {
     namespace = "com.gocalsd.sparechange"
-    compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
-    }
+    compileSdk = 36
 
     publishing {
         singleVariant("release") {
@@ -34,6 +31,20 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+afterEvaluate {
+    configure<PublishingExtension> {
+        publications {
+            register<MavenPublication>("release") {
+                from(components["release"])
+                
+                groupId = "com.github.rgocal"
+                artifactId = "SpareChange"
+                version = "1.0.0"
+            }
+        }
     }
 }
 
