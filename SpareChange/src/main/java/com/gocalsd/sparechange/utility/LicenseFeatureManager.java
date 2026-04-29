@@ -2,7 +2,7 @@ package com.gocalsd.sparechange.utility;
 
 import androidx.annotation.NonNull;
 
-import com.gocalsd.sparechange.BillingManager;
+import com.gocalsd.sparechange.SpareChange;
 import com.gocalsd.sparechange.policy.LicensePolicy;
 
 import java.util.Set;
@@ -13,11 +13,11 @@ import java.util.Set;
  */
 public class LicenseFeatureManager {
 
-    private final BillingManager billingManager;
+    private final SpareChange billingManager;
     private final LicensePolicy licensePolicy;
 
     public LicenseFeatureManager(
-            @NonNull BillingManager billingManager,
+            @NonNull SpareChange billingManager,
             @NonNull LicensePolicy licensePolicy
     ) {
         this.billingManager = billingManager;

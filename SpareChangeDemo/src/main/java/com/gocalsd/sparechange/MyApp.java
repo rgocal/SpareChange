@@ -38,7 +38,7 @@ public class MyApp extends android.app.Application {
         super.onCreate();
         INSTANCE = this;
 
-        BillingManager.init(
+        SpareChange.init(
                 this,
                 getConsumableSkus(),
                 getLicenseSkus(),

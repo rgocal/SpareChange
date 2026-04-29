@@ -37,7 +37,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-public class BillingManager implements
+public class SpareChange implements
         com.android.billingclient.api.PurchasesUpdatedListener,
         BillingClientStateListener {
 
@@ -45,7 +45,7 @@ public class BillingManager implements
     private static final String KEY_PRICE_MICROS_PREFIX = "price_micros_";
     private static final String KEY_PRICE_CURRENCY_PREFIX = "price_currency_";
 
-    private static volatile BillingManager INSTANCE;
+    private static volatile SpareChange INSTANCE;
 
     private final Context appContext;
 
@@ -85,7 +85,7 @@ public class BillingManager implements
      * @param autoAckSubscriptions auto-ack subscription purchases
      * @param autoConsumeConsumables auto-consume consumable INAPP purchases
      */
-    public static BillingManager init(
+    public static SpareChange init(
             @NonNull Context context,
             @NonNull Set<String> consumableIds,
             @NonNull Set<String> oneTimeIds,
@@ -95,9 +95,9 @@ public class BillingManager implements
             boolean autoConsumeConsumables
     ) {
         if (INSTANCE == null) {
-            synchronized (BillingManager.class) {
+            synchronized (SpareChange.class) {
                 if (INSTANCE == null) {
-                    INSTANCE = new BillingManager(
+                    INSTANCE = new SpareChange(
                             context.getApplicationContext(),
                             consumableIds,
                             oneTimeIds,
@@ -117,7 +117,7 @@ public class BillingManager implements
      * - auto-ack non-consumables & subs
      * - auto-consume consumables
      */
-    public static BillingManager init(
+    public static SpareChange init(
             @NonNull Context context,
             @NonNull Set<String> consumableIds,
             @NonNull Set<String> oneTimeIds,
@@ -127,14 +127,14 @@ public class BillingManager implements
                 true, true, true);
     }
 
-    public static BillingManager getInstance() {
+    public static SpareChange getInstance() {
         if (INSTANCE == null) {
             throw new IllegalStateException("BillingManager.init() must be called first");
         }
         return INSTANCE;
     }
 
-    private BillingManager(
+    private SpareChange(
             Context context,
             Set<String> consumableIds,
             Set<String> oneTimeIds,
