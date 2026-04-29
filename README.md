@@ -23,8 +23,11 @@ It wraps the official Play Billing Library v8+ and provides:
 ✅ Built in License Manager to help track sku purchases
 
 Java Version Required : Version 17
+
 Local Installatiohn : include(":SpareChange")
+```
 implementation 'com.github.rgocal:SpareChange:1.00'
+```
 
 Initialization
 Call this once inside your Application class:
