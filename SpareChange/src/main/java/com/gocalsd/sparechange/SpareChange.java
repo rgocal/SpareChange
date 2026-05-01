@@ -59,12 +59,14 @@ public class SpareChange implements
     // Ownership tracking
     private final Map<String, Boolean> ownedOneTimeProducts = new ConcurrentHashMap<>();
     private final Map<String, Boolean> activeSubscriptions = new ConcurrentHashMap<>();
+    private final Set<String> pendingProductIds = ConcurrentHashMap.newKeySet();
 
     // ProductDetails cache for ALL SKUs
     private final Map<String, ProductDetails> productDetailsCache = new ConcurrentHashMap<>();
 
     private BillingClient billingClient;
     private boolean isReady = false;
+    private boolean isLaunchingFlow = false;
 
     // Behavior flags
     private final boolean autoAcknowledgeNonConsumables;
@@ -231,6 +233,11 @@ public class SpareChange implements
         return active != null && active;
     }
 
+    /** Check if a purchase for this product is currently pending (e.g., cash payment). */
+    public boolean isPurchasePending(@NonNull String productId) {
+        return pendingProductIds.contains(productId);
+    }
+
     /** Get cached ProductDetails for a given productId, or null. */
     @Nullable
     public ProductDetails getProductDetails(@NonNull String productId) {
@@ -358,6 +365,28 @@ public class SpareChange implements
                     .build();
         }
 
+        if (isLaunchingFlow) {
+            return BillingResult.newBuilder()
+                    .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
+                    .setDebugMessage("A purchase flow is already in progress")
+                    .build();
+        }
+
+        // Prevent buying something already owned or pending
+        if (isOneTimeProductOwned(productId) || isSubscriptionActive(productId)) {
+            return BillingResult.newBuilder()
+                    .setResponseCode(BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED)
+                    .setDebugMessage("Product already owned: " + productId)
+                    .build();
+        }
+
+        if (isPurchasePending(productId)) {
+            return BillingResult.newBuilder()
+                    .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
+                    .setDebugMessage("Purchase is pending for " + productId)
+                    .build();
+        }
+
         ProductDetails pd = getProductDetails(productId);
         if (pd == null) {
             return BillingResult.newBuilder()
@@ -408,7 +437,12 @@ public class SpareChange implements
                 )
                 .build();
 
-        return billingClient.launchBillingFlow(activity, flowParams);
+        isLaunchingFlow = true;
+        try {
+            return billingClient.launchBillingFlow(activity, flowParams);
+        } finally {
+            isLaunchingFlow = false;
+        }
     }
 
     /** Explicit acknowledge helper if you want manual control. */
@@ -510,8 +544,13 @@ public class SpareChange implements
 
     private void handleInappPurchaseSnapshot(@NonNull List<Purchase> purchases) {
         Map<String, Boolean> snapshotOneTime = new ConcurrentHashMap<>();
+        List<String> currentPending = new ArrayList<>();
 
         for (Purchase purchase : purchases) {
+            if (purchase.getPurchaseState() == Purchase.PurchaseState.PENDING) {
+                currentPending.addAll(purchase.getProducts());
+                continue;
+            }
             if (purchase.getPurchaseState() != Purchase.PurchaseState.PURCHASED) {
                 continue;
             }
@@ -520,6 +559,15 @@ public class SpareChange implements
                 if (oneTimeProductIds.contains(productId)) {
                     snapshotOneTime.put(productId, true);
                 }
+            }
+        }
+
+        // Update pending set
+        for (String id : oneTimeProductIds) {
+            if (currentPending.contains(id)) {
+                pendingProductIds.add(id);
+            } else {
+                pendingProductIds.remove(id);
             }
         }
 
@@ -535,8 +583,13 @@ public class SpareChange implements
 
     private void handleSubscriptionSnapshot(@NonNull List<Purchase> purchases) {
         Map<String, Boolean> snapshotSubs = new ConcurrentHashMap<>();
+        List<String> currentPending = new ArrayList<>();
 
         for (Purchase purchase : purchases) {
+            if (purchase.getPurchaseState() == Purchase.PurchaseState.PENDING) {
+                currentPending.addAll(purchase.getProducts());
+                continue;
+            }
             if (purchase.getPurchaseState() != Purchase.PurchaseState.PURCHASED) {
                 continue;
             }
@@ -545,6 +598,15 @@ public class SpareChange implements
                 if (subscriptionProductIds.contains(productId)) {
                     snapshotSubs.put(productId, true);
                 }
+            }
+        }
+
+        // Update pending set
+        for (String id : subscriptionProductIds) {
+            if (currentPending.contains(id)) {
+                pendingProductIds.add(id);
+            } else {
+                pendingProductIds.remove(id);
             }
         }
 
@@ -559,12 +621,22 @@ public class SpareChange implements
     }
 
     private void handleSinglePurchase(@NonNull Purchase purchase) {
-        if (purchase.getPurchaseState() != Purchase.PurchaseState.PURCHASED) {
+        List<String> productIds = purchase.getProducts();
+        if (productIds == null || productIds.isEmpty()) return;
+
+        if (purchase.getPurchaseState() == Purchase.PurchaseState.PENDING) {
+            pendingProductIds.addAll(productIds);
             return;
         }
 
-        List<String> productIds = purchase.getProducts();
-        if (productIds == null || productIds.isEmpty()) return;
+        if (purchase.getPurchaseState() != Purchase.PurchaseState.PURCHASED) {
+            // If it was pending and now it's canceled/expired, remove it
+            pendingProductIds.removeAll(productIds);
+            return;
+        }
+
+        // It is PURCHASED - ensure it is removed from pending
+        pendingProductIds.removeAll(productIds);
 
         String firstId = productIds.get(0);
         ProductCategory category = getProductCategory(firstId);
