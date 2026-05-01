@@ -15,7 +15,7 @@ android {
     }
 
     defaultConfig {
-        minSdk = 26
+        minSdk = 29
         consumerProguardFiles("consumer-rules.pro")
     }
 
@@ -42,7 +42,7 @@ afterEvaluate {
                 
                 groupId = "com.github.rgocal"
                 artifactId = "SpareChange"
-                version = "1.0.1"
+                version = "1.0.2"
             }
         }
     }
