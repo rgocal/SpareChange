@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.gocalsd.sparechange"
-    compileSdk = 35
+    compileSdk = 37
 
     publishing {
         singleVariant("release") {
@@ -42,7 +42,7 @@ afterEvaluate {
                 
                 groupId = "com.github.rgocal"
                 artifactId = "SpareChange"
-                version = "1.0.2"
+                version = "1.0.3"
             }
         }
     }
@@ -50,4 +50,7 @@ afterEvaluate {
 
 dependencies {
     api(libs.billing)
+    implementation(libs.kotlin.coroutines)
+    implementation(libs.lifecycle.process)
+    implementation(libs.lifecycle.runtime.ktx)
 }

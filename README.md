@@ -1,181 +1,189 @@
-SpareChange is a lightweight Android library that makes Google Play Billing simple, safe, and developer-friendly.
+# SpareChange
 
-It wraps the official Play Billing Library v8+ and provides:
+SpareChange is a modernized, lightweight Android library that makes Google Play Billing simple, safe, and developer-friendly.
 
-✅ Easy setup & initialization
+It wraps the official Play Billing Library v7+ and provides:
 
-✅ Automatic ProductDetails loading (live Play Store prices)
+✅ **Kotlin-First API**: Built with Coroutines and Flow for real-time updates.
+✅ **Easy Setup**: Single-point initialization and global access.
+✅ **Reactive States**: `StateFlow` support for ownership, subscriptions, and product details.
+✅ **Lifecycle Aware**: Automatically refreshes ownership when the app returns to the foreground.
+✅ **Automatic Management**: Handles consumption and acknowledgement automatically.
+✅ **Price Change Detection**: Tracks local price changes for your SKUs.
+✅ **Robust Reconnection**: Exponential backoff strategy for service disconnections.
 
-✅ Detects price changes (increase/decrease)
+## Installation
 
-✅ Detects ownership changes for:
-
-    • Consumables
-    • One-time purchases (non-consumables, licenses)
-    • Subscriptions
-    
-✅ Automatically consumes or acknowledges purchases
-
-✅ Unified simple API: launchPurchase("sku_id")
-
-✅ Listener for billing availability, purchase updates, and SKU status
-
-✅ Built in License Manager to help track sku purchases
-
-Java Version Required : Version 17
-
-Local Installatiohn : include(":SpareChange")
-```
-implementation 'com.github.rgocal:SpareChange:1'
+```kotlin
+implementation("com.github.rgocal:SpareChange:1.0.3")
 ```
 
-Initialization
-Call this once inside your Application class:
+## Initialization
 
-```
-public class MyApp extends Application {
+Call this once inside your `Application` class:
 
-    @Override
-    public void onCreate() {
-        super.onCreate();
+```kotlin
+class MyApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
 
-        Set<String> consumables = Set.of("coins_100");
-        Set<String> oneTime = Set.of("license_pro");
-        Set<String> subs = Set.of("sub_premium");
+        val consumables = setOf("coins_100")
+        val oneTime = setOf("license_pro")
+        val subs = setOf("sub_premium")
 
-        BillingManager.init(
-                this,
-                consumables,
-                oneTime,
-                subs,
-                true,   // autoAckNonConsumables
-                true,   // autoAckSubscriptions
-                true    // autoConsumeConsumables
-        );
-    }}
-
-```
-   
-What the categories mean:
-Type	Auto-consume?	Auto-Acknowledge?	Ownership Stored?	Typical Use
-CONSUMABLE	Yes	No	No	Coins, boosts, refills
-ONE_TIME	No	Yes	Yes	Premium license / upgrade
-SUBSCRIPTION	No	Yes	Yes	Monthly / yearly access
-
-Using in Activities / Fragments
-You must register a listener:
-
-```
-public class BillingDemoActivity extends AppCompatActivity implements BillingEventListener {
-
-    private BillingManager billing;
-
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-
-        billing = BillingManager.getInstance();
-        billing.addListener(this);
-        billing.startConnection();  // safe to call repeatedly
-    }
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        billing.removeListener(this);
-    }}
-```
-
-Launch a purchase
-```
-    BillingResult result = billing.launchPurchase(this, "license_pro");
-    if (result.getResponseCode() != BillingClient.BillingResponseCode.OK) {
-    Toast.makeText(this, "Cannot start purchase", Toast.LENGTH_SHORT).show();
-    }
-```
-
-Checking ownership
-
-```
-boolean hasPro = billing.isOneTimeProductOwned("license_pro");
-boolean subActive = billing.isSubscriptionActive("sub_premium");
-```
-
-ProductDetails (price, title, description)
-Prices load automatically when BillingClient becomes ready.
-
-```
-@Override
-public void onProductDetailsLoaded(@NonNull Map<String, ProductDetails> details) {
-    ProductDetails pd = details.get("license_pro");
-    if (pd != null && pd.getOneTimePurchaseOfferDetails() != null) {
-        String price = pd.getOneTimePurchaseOfferDetails().getFormattedPrice();
-        textViewPrice.setText(price);
+        SpareChange.init(
+            context = this,
+            consumableIds = consumables,
+            oneTimeIds = oneTime,
+            subscriptionIds = subs,
+            autoAckNonConsumables = true,
+            autoAckSubscriptions = true,
+            autoConsumeConsumables = true
+        )
     }
 }
 ```
-    
-Price-change detection (unique feature)
-The library automatically tracks SKU prices stored on the device and fires a callback when they change.
 
-```
-@Override
-public void onProductPriceChanged(
-    @NonNull String productId,
-    long oldPriceMicros,
-    @NonNull String oldCurrency,
-    long newPriceMicros,
-    @NonNull String newCurrency
-) {
-    double oldVal = oldPriceMicros / 1_000_000d;
-    double newVal = newPriceMicros / 1_000_000d;
+## Usage
 
-    Log.d("BILLING", productId + " price changed: " + oldVal + " → " + newVal);
-}
-```
+### Reactive State (Kotlin Flow)
+The most modern way to observe billing state is via `StateFlow`.
 
-Full API IMPLEMENTATION
-```
-public interface BillingEventListener {
-
-    void onBillingClientReady();
-
-    void onBillingClientUnavailable(BillingResult result);
-
-    void onPurchasesUpdated(BillingResult result, List<Purchase> purchases);
-
-    void onOneTimeProductOwnershipChanged(String sku, boolean owned);
-
-    void onSubscriptionOwnershipChanged(String sku, boolean active);
-
-    void onProductDetailsLoaded(Map<String, ProductDetails> details);
-
-    void onProductPriceChanged(
-        String sku,
-        long oldPriceMicros,
-        String oldCurrency,
-        long newPriceMicros,
-        String newCurrency
-    );
-}
-```
-
-Feature Licensing System (Optional)
-If your app has gated features:
-```
-LicensePolicy policy = new LicensePolicy() {
-    @Override
-    public Set<String> getSkusForFeature(String key) {
-        switch (key) {
-            case "feature_deepsight": return Set.of("license_pro");
-            case "feature_snapshot":  return Set.of("license_basic", "license_pro");
+```kotlin
+lifecycleScope.launch {
+    repeatOnLifecycle(Lifecycle.State.STARTED) {
+        SpareChange.getInstance().ownedOneTimeProducts.collect { ownedMap ->
+            val hasPro = ownedMap["license_pro"] == true
+            // Update UI
         }
-        return Set.of();
     }
-};
-
-LicenseFeatureManager manager =
-        new LicenseFeatureManager(BillingManager.getInstance(), policy);
-
-boolean allowed = manager.hasFeature("feature_deepsight");
+}
 ```
+
+### Traditional Listener
+You can still use the listener pattern for traditional event handling.
+
+```kotlin
+class MyActivity : AppCompatActivity(), BillingEventListener {
+    private lateinit var billing: SpareChange
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        billing = SpareChange.getInstance()
+        billing.addListener(this)
+        billing.startConnection()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        billing.removeListener(this)
+    }
+
+    // Implement BillingEventListener methods...
+}
+```
+
+### Launching a Purchase
+
+```kotlin
+val result = billing.launchPurchase(this, "license_pro")
+if (result.responseCode != BillingClient.BillingResponseCode.OK) {
+    Toast.makeText(this, "Cannot start purchase: ${result.debugMessage}", Toast.LENGTH_SHORT).show()
+}
+```
+
+## Categories Overview
+
+| Type | Auto-consume? | Auto-Acknowledge? | Ownership Stored? | Typical Use |
+| :--- | :--- | :--- | :--- | :--- |
+| **CONSUMABLE** | Yes | No | No | Coins, boosts, refills |
+| **ONE_TIME** | No | Yes | Yes | Premium license / upgrade |
+| **SUBSCRIPTION** | No | Yes | Yes | Monthly / yearly access |
+
+## Advanced Features
+
+### Price Change Detection
+SpareChange tracks SKU prices locally and notifies you if they change (useful for "Price Dropped!" notifications).
+
+```kotlin
+override fun onProductPriceChanged(
+    productId: String,
+    oldPriceMicros: Long,
+    oldCurrency: String,
+    newPriceMicros: Long,
+    newCurrency: String
+) {
+    // Notify user about price change
+}
+```
+
+### Lifecycle Awareness
+The library automatically calls `refreshOwnership()` whenever your app moves to the `RESUMED` state. This ensures your app catches subscription cancellations or outside purchases immediately.
+
+### Reconnection Logic
+If the Billing Service disconnects, SpareChange uses an exponential backoff strategy (up to 30s) to reconnect without flooding the system.
+
+## API Reference
+
+### BillingEventListener
+```kotlin
+interface BillingEventListener {
+    fun onBillingClientReady()
+    fun onBillingClientUnavailable(billingResult: BillingResult)
+    fun onPurchasesUpdated(billingResult: BillingResult, purchases: List<Purchase>?)
+    fun onOneTimeProductOwnershipChanged(productId: String, isOwned: Boolean)
+    fun onSubscriptionOwnershipChanged(productId: String, isActive: Boolean)
+    fun onProductDetailsLoaded(productDetailsMap: Map<String, ProductDetails>)
+    fun onProductPriceChanged(productId: String, oldPriceMicros: Long, oldCurrency: String, newPriceMicros: Long, newCurrency: String)
+    fun onPurchaseConsumed(productId: String, billingResult: BillingResult)
+    fun onPurchaseAcknowledged(productId: String, billingResult: BillingResult)
+}
+```
+
+### License Feature Manager
+A modernized helper to map SKUs to specific app features with full reactive support.
+
+```kotlin
+// Define policy
+val policy = LicensePolicy { featureKey ->
+    when (featureKey) {
+        "premium_filters" -> setOf("license_pro", "sub_premium")
+        else -> emptySet()
+    }
+}
+
+// Initialize manager
+// strictSubscriptionRevocation = false (default): User keeps access until sub expires.
+// strictSubscriptionRevocation = true: User loses access immediately upon hitting "Cancel".
+val manager = LicenseFeatureManager(
+    billingManager = SpareChange.getInstance(),
+    licensePolicy = policy,
+    strictSubscriptionRevocation = false 
+)
+
+// Observe feature (auto-updates on purchase or cancellation)
+manager.observeFeature("premium_filters").collect { unlocked ->
+    // ...
+}
+```
+
+## Subscription Management
+
+SpareChange provides a detailed `SubscriptionStatus` model to help you understand exactly what's happening with a user's subscription.
+
+```kotlin
+val status = spareChange.getSubscriptionStatus("sub_premium")
+
+status?.let {
+    if (it.isActive && !it.isAutoRenewing) {
+        // User has canceled, but still has time remaining!
+        // You could show a "Renew now to keep access" banner.
+    }
+}
+```
+
+| Property | Description |
+| :--- | :--- |
+| `isActive` | True if the subscription is still in the `PURCHASED` state. |
+| `isAutoRenewing` | False if the user has canceled the subscription in the Play Store. |
+| `purchaseTime` | Epoch time when the current period started. |

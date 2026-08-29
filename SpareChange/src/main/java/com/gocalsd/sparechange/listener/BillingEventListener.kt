@@ -1,59 +1,63 @@
-package com.gocalsd.sparechange.listener;
+package com.gocalsd.sparechange.listener
 
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
+import com.android.billingclient.api.BillingResult
+import com.android.billingclient.api.ProductDetails
+import com.android.billingclient.api.Purchase
 
-import com.android.billingclient.api.BillingResult;
-import com.android.billingclient.api.ProductDetails;
-import com.android.billingclient.api.Purchase;
-
-import java.util.List;
-import java.util.Map;
-
-public interface BillingEventListener {
+interface BillingEventListener {
 
     /** BillingClient is connected and ready. */
-    void onBillingClientReady();
+    fun onBillingClientReady()
 
     /** Billing is not available or an operation failed. */
-    void onBillingClientUnavailable(@NonNull BillingResult billingResult);
+    fun onBillingClientUnavailable(billingResult: BillingResult)
 
     /** Raw purchase events (new, pending, etc). */
-    void onPurchasesUpdated(
-            @NonNull BillingResult billingResult,
-            @Nullable List<Purchase> purchases
-    );
+    fun onPurchasesUpdated(
+        billingResult: BillingResult,
+        purchases: List<Purchase>?
+    )
 
     /** One-time (non-consumable INAPP) license ownership changed. */
-    void onOneTimeProductOwnershipChanged(
-            @NonNull String productId,
-            boolean isOwned
-    );
+    fun onOneTimeProductOwnershipChanged(
+        productId: String,
+        isOwned: Boolean
+    )
 
     /** Subscription ownership changed (active or not). */
-    void onSubscriptionOwnershipChanged(
-            @NonNull String productId,
-            boolean isActive
-    );
+    fun onSubscriptionOwnershipChanged(
+        productId: String,
+        isActive: Boolean
+    )
 
     /**
      * Fired when ProductDetails have been loaded/refreshed
      * and cached by BillingManager.
      */
-    void onProductDetailsLoaded(
-            @NonNull Map<String, ProductDetails> productDetailsMap
-    );
+    fun onProductDetailsLoaded(
+        productDetailsMap: Map<String, ProductDetails>
+    )
 
     /**
      * Called when the library detects that the price of a product has changed
      * compared to the last known value stored on this device.
      * Prices are in micros (1,000,000 micros = 1 unit of currency).
      */
-    void onProductPriceChanged(
-            @NonNull String productId,
-            long oldPriceMicros,
-            @NonNull String oldCurrency,
-            long newPriceMicros,
-            @NonNull String newCurrency
-    );
+    fun onProductPriceChanged(
+        productId: String,
+        oldPriceMicros: Long,
+        oldCurrency: String,
+        newPriceMicros: Long,
+        newCurrency: String
+    )
+
+    /**
+     * Called when a purchase has been successfully consumed.
+     */
+    fun onPurchaseConsumed(productId: String, billingResult: BillingResult)
+
+    /**
+     * Called when a purchase has been successfully acknowledged.
+     */
+    fun onPurchaseAcknowledged(productId: String, billingResult: BillingResult)
 }

@@ -1,41 +1,97 @@
-package com.gocalsd.sparechange.utility;
+package com.gocalsd.sparechange.utility
 
-import androidx.annotation.NonNull;
-
-import com.gocalsd.sparechange.SpareChange;
-import com.gocalsd.sparechange.policy.LicensePolicy;
-
-import java.util.Set;
+import com.gocalsd.sparechange.SpareChange
+import com.gocalsd.sparechange.policy.LicensePolicy
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 
 /**
- * Thin helper to ask "does the user have feature X?"
- * based on the current owned one-time products in BillingManager.
+ * Modernized helper to ask "does the user have feature X?"
+ * Integrates with SpareChange's reactive flows and supports both
+ * one-time licenses and active subscriptions.
+ *
+ * @param billingManager The SpareChange instance.
+ * @param licensePolicy The policy mapping features to SKUs.
+ * @param strictSubscriptionRevocation If true, features granted by subscriptions
+ *                                     are revoked the moment the user cancels
+ *                                     (isAutoRenewing == false). If false (default),
+ *                                     features remain active until the subscription
+ *                                     actually expires.
  */
-public class LicenseFeatureManager {
+class LicenseFeatureManager(
+    private val billingManager: SpareChange,
+    private val licensePolicy: LicensePolicy,
+    private val strictSubscriptionRevocation: Boolean = false
+) {
 
-    private final SpareChange billingManager;
-    private final LicensePolicy licensePolicy;
+    /**
+     * Returns true if ANY SKU that unlocks this feature is currently owned.
+     */
+    fun hasFeature(featureKey: String): Boolean {
+        val skus = licensePolicy.getSkusForFeature(featureKey)
+        if (skus.isEmpty()) return false
 
-    public LicenseFeatureManager(
-            @NonNull SpareChange billingManager,
-            @NonNull LicensePolicy licensePolicy
-    ) {
-        this.billingManager = billingManager;
-        this.licensePolicy = licensePolicy;
+        return skus.any { sku ->
+            val isOneTimeOwned = billingManager.isOneTimeProductOwned(sku)
+            val subStatus = billingManager.getSubscriptionStatus(sku)
+            
+            val isSubscriptionValid = if (strictSubscriptionRevocation) {
+                subStatus?.isActive == true && subStatus.isAutoRenewing
+            } else {
+                subStatus?.isActive == true
+            }
+
+            isOneTimeOwned || isSubscriptionValid
+        }
     }
 
     /**
-     * Returns true if ANY SKU that unlocks this feature is owned.
+     * Returns a Flow that emits true if the feature is unlocked.
+     * This will automatically emit new values whenever ownership or
+     * subscription status changes in real-time.
      */
-    public boolean hasFeature(@NonNull String featureKey) {
-        Set<String> skus = licensePolicy.getSkusForFeature(featureKey);
-        if (skus == null || skus.isEmpty()) return false;
+    fun observeFeature(featureKey: String): Flow<Boolean> {
+        val skus = licensePolicy.getSkusForFeature(featureKey)
+        if (skus.isEmpty()) return kotlinx.coroutines.flow.flowOf(false)
 
-        for (String sku : skus) {
-            if (billingManager.isOneTimeProductOwned(sku)) {
-                return true;
+        return combine(
+            billingManager.ownedOneTimeProducts,
+            billingManager.activeSubscriptions
+        ) { ownedOneTime, activeSubs ->
+            skus.any { sku ->
+                val isOneTimeOwned = ownedOneTime[sku] == true
+                val subStatus = activeSubs[sku]
+
+                val isSubscriptionValid = if (strictSubscriptionRevocation) {
+                    subStatus?.isActive == true && subStatus.isAutoRenewing
+                } else {
+                    subStatus?.isActive == true
+                }
+
+                isOneTimeOwned || isSubscriptionValid
             }
         }
-        return false;
+    }
+
+    /**
+     * Convenience method to observe multiple features at once.
+     * Emits true only if ALL features are unlocked.
+     */
+    fun observeAllFeatures(vararg featureKeys: String): Flow<Boolean> {
+        val flows = featureKeys.map { observeFeature(it) }
+        return combine(flows) { results ->
+            results.all { it }
+        }
+    }
+
+    /**
+     * Convenience method to observe multiple features at once.
+     * Emits true if ANY of the features are unlocked.
+     */
+    fun observeAnyFeature(vararg featureKeys: String): Flow<Boolean> {
+        val flows = featureKeys.map { observeFeature(it) }
+        return combine(flows) { results ->
+            results.any { it }
+        }
     }
 }

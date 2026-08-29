@@ -1,825 +1,558 @@
-package com.gocalsd.sparechange;
+package com.gocalsd.sparechange
 
-import android.app.Activity;
-import android.content.Context;
-import android.content.SharedPreferences;
-import android.os.Handler;
-import android.os.Looper;
+import android.app.Activity
+import android.content.Context
+import android.content.SharedPreferences
+import android.util.Log
+import androidx.annotation.MainThread
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
+import com.android.billingclient.api.*
+import com.gocalsd.sparechange.listener.BillingEventListener
+import com.gocalsd.sparechange.model.PriceInfo
+import com.gocalsd.sparechange.model.ProductCategory
+import com.gocalsd.sparechange.model.SubscriptionStatus
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.math.pow
 
-import androidx.annotation.MainThread;
-import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
+class SpareChange private constructor(
+    private val appContext: Context,
+    consumableIds: Set<String>,
+    oneTimeIds: Set<String>,
+    subscriptionIds: Set<String>,
+    private val autoAcknowledgeNonConsumables: Boolean,
+    private val autoAcknowledgeSubscriptions: Boolean,
+    private val autoConsumeConsumables: Boolean
+) : PurchasesUpdatedListener, BillingClientStateListener, DefaultLifecycleObserver {
 
-import com.android.billingclient.api.AcknowledgePurchaseParams;
-import com.android.billingclient.api.AcknowledgePurchaseResponseListener;
-import com.android.billingclient.api.BillingClient;
-import com.android.billingclient.api.BillingClientStateListener;
-import com.android.billingclient.api.BillingFlowParams;
-import com.android.billingclient.api.BillingResult;
-import com.android.billingclient.api.ConsumeParams;
-import com.android.billingclient.api.ConsumeResponseListener;
-import com.android.billingclient.api.PendingPurchasesParams;
-import com.android.billingclient.api.ProductDetails;
-import com.android.billingclient.api.Purchase;
-import com.android.billingclient.api.QueryProductDetailsParams;
-import com.android.billingclient.api.QueryPurchasesParams;
-import com.gocalsd.sparechange.listener.BillingEventListener;
-import com.gocalsd.sparechange.model.PriceInfo;
-import com.gocalsd.sparechange.model.ProductCategory;
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var billingClient: BillingClient? = null
+    
+    private val _isReady = MutableStateFlow(false)
+    val isReady: StateFlow<Boolean> = _isReady.asStateFlow()
 
+    private val consumableProductIds = consumableIds.toSet()
+    private val oneTimeProductIds = oneTimeIds.toSet()
+    private val subscriptionProductIds = subscriptionIds.toSet()
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
+    private val listeners = CopyOnWriteArrayList<BillingEventListener>()
 
-public class SpareChange implements
-        com.android.billingclient.api.PurchasesUpdatedListener,
-        BillingClientStateListener {
+    private val _ownedOneTimeProducts = MutableStateFlow<Map<String, Boolean>>(emptyMap())
+    val ownedOneTimeProducts: StateFlow<Map<String, Boolean>> = _ownedOneTimeProducts.asStateFlow()
 
-    private static final String PREFS_NAME = "billinghelper_prices";
-    private static final String KEY_PRICE_MICROS_PREFIX = "price_micros_";
-    private static final String KEY_PRICE_CURRENCY_PREFIX = "price_currency_";
+    private val _activeSubscriptions = MutableStateFlow<Map<String, SubscriptionStatus>>(emptyMap())
+    val activeSubscriptions: StateFlow<Map<String, SubscriptionStatus>> = _activeSubscriptions.asStateFlow()
 
-    private static volatile SpareChange INSTANCE;
+    private val _pendingProductIds = MutableStateFlow<Set<String>>(emptySet())
+    val pendingProductIds: StateFlow<Set<String>> = _pendingProductIds.asStateFlow()
 
-    private final Context appContext;
+    private val _productDetailsCache = MutableStateFlow<Map<String, ProductDetails>>(emptyMap())
+    val productDetailsCache: StateFlow<Map<String, ProductDetails>> = _productDetailsCache.asStateFlow()
 
-    // SKU classification
-    private final Set<String> consumableProductIds;
-    private final Set<String> oneTimeProductIds;
-    private final Set<String> subscriptionProductIds;
+    private var isLaunchingFlow = false
+    private var reconnectRetryCount = 0
 
-    private final List<BillingEventListener> listeners = new CopyOnWriteArrayList<>();
+    private val pricePrefs: SharedPreferences = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    // Ownership tracking
-    private final Map<String, Boolean> ownedOneTimeProducts = new ConcurrentHashMap<>();
-    private final Map<String, Boolean> activeSubscriptions = new ConcurrentHashMap<>();
-    private final Set<String> pendingProductIds = ConcurrentHashMap.newKeySet();
+    companion object {
+        private const val TAG = "SpareChange"
+        private const val PREFS_NAME = "billinghelper_prices"
+        private const val KEY_PRICE_MICROS_PREFIX = "price_micros_"
+        private const val KEY_PRICE_CURRENCY_PREFIX = "price_currency_"
+        private const val MAX_RECONNECT_DELAY_MS = 30000L
 
-    // ProductDetails cache for ALL SKUs
-    private final Map<String, ProductDetails> productDetailsCache = new ConcurrentHashMap<>();
+        @Volatile
+        private var INSTANCE: SpareChange? = null
 
-    private BillingClient billingClient;
-    private boolean isReady = false;
-    private boolean isLaunchingFlow = false;
-
-    // Behavior flags
-    private final boolean autoAcknowledgeNonConsumables;
-    private final boolean autoAcknowledgeSubscriptions;
-    private final boolean autoConsumeConsumables;
-
-    // Price storage
-    private final SharedPreferences pricePrefs;
-
-    /**
-     * Initialize the global BillingManager.
-     *
-     * @param context app context
-     * @param consumableIds INAPP SKUs that should be consumed when purchased
-     * @param oneTimeIds INAPP SKUs that are non-consumable (licenses)
-     * @param subscriptionIds SUBS SKUs
-     * @param autoAckNonConsumables auto-ack one-time purchases
-     * @param autoAckSubscriptions auto-ack subscription purchases
-     * @param autoConsumeConsumables auto-consume consumable INAPP purchases
-     */
-    public static SpareChange init(
-            @NonNull Context context,
-            @NonNull Set<String> consumableIds,
-            @NonNull Set<String> oneTimeIds,
-            @NonNull Set<String> subscriptionIds,
-            boolean autoAckNonConsumables,
-            boolean autoAckSubscriptions,
-            boolean autoConsumeConsumables
-    ) {
-        if (INSTANCE == null) {
-            synchronized (SpareChange.class) {
-                if (INSTANCE == null) {
-                    INSTANCE = new SpareChange(
-                            context.getApplicationContext(),
-                            consumableIds,
-                            oneTimeIds,
-                            subscriptionIds,
-                            autoAckNonConsumables,
-                            autoAckSubscriptions,
-                            autoConsumeConsumables
-                    );
+        @JvmStatic
+        fun init(
+            context: Context,
+            consumableIds: Set<String>,
+            oneTimeIds: Set<String>,
+            subscriptionIds: Set<String>,
+            autoAckNonConsumables: Boolean = true,
+            autoAckSubscriptions: Boolean = true,
+            autoConsumeConsumables: Boolean = true
+        ): SpareChange {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: SpareChange(
+                    context.applicationContext,
+                    consumableIds,
+                    oneTimeIds,
+                    subscriptionIds,
+                    autoAckNonConsumables,
+                    autoAckSubscriptions,
+                    autoConsumeConsumables
+                ).also { 
+                    INSTANCE = it
+                    ProcessLifecycleOwner.get().lifecycle.addObserver(it)
                 }
             }
         }
-        return INSTANCE;
+
+        @JvmStatic
+        fun getInstance(): SpareChange {
+            return INSTANCE ?: throw IllegalStateException("SpareChange.init() must be called first")
+        }
     }
+
+    init {
+        buildClient()
+    }
+
+    private fun buildClient() {
+        billingClient = BillingClient.newBuilder(appContext)
+            .enablePendingPurchases(
+                PendingPurchasesParams.newBuilder()
+                    .enableOneTimeProducts()
+                    .build()
+            )
+            .setListener(this)
+            .build()
+    }
+
+    override fun onResume(owner: LifecycleOwner) {
+        super.onResume(owner)
+        if (_isReady.value) {
+            refreshOwnership()
+        }
+    }
+
+    fun addListener(listener: BillingEventListener) {
+        if (!listeners.contains(listener)) {
+            listeners.add(listener)
+        }
+        if (_isReady.value) {
+            listener.onBillingClientReady()
+            val snapshot = _productDetailsCache.value
+            if (snapshot.isNotEmpty()) {
+                listener.onProductDetailsLoaded(snapshot)
+            }
+        }
+    }
+
+    fun removeListener(listener: BillingEventListener) {
+        listeners.remove(listener)
+    }
+
+    fun startConnection() {
+        if (billingClient?.isReady == true) {
+            _isReady.value = true
+            notifyBillingReady()
+            refreshOwnership()
+            refreshProductDetails()
+            return
+        }
+        billingClient?.startConnection(this)
+    }
+
+    fun getProductCategory(productId: String): ProductCategory {
+        return when {
+            consumableProductIds.contains(productId) -> ProductCategory.CONSUMABLE
+            oneTimeProductIds.contains(productId) -> ProductCategory.ONE_TIME
+            subscriptionProductIds.contains(productId) -> ProductCategory.SUBSCRIPTION
+            else -> ProductCategory.UNKNOWN
+        }
+    }
+
+    fun isOneTimeProductOwned(productId: String): Boolean = _ownedOneTimeProducts.value[productId] == true
+
+    fun isSubscriptionActive(productId: String): Boolean = _activeSubscriptions.value[productId]?.isActive == true
 
     /**
-     * Convenience init with typical defaults:
-     * - auto-ack non-consumables & subs
-     * - auto-consume consumables
+     * Get the full subscription status for a given productId.
      */
-    public static SpareChange init(
-            @NonNull Context context,
-            @NonNull Set<String> consumableIds,
-            @NonNull Set<String> oneTimeIds,
-            @NonNull Set<String> subscriptionIds
-    ) {
-        return init(context, consumableIds, oneTimeIds, subscriptionIds,
-                true, true, true);
-    }
+    fun getSubscriptionStatus(productId: String): SubscriptionStatus? = _activeSubscriptions.value[productId]
 
-    public static SpareChange getInstance() {
-        if (INSTANCE == null) {
-            throw new IllegalStateException("BillingManager.init() must be called first");
+    fun isPurchasePending(productId: String): Boolean = _pendingProductIds.value.contains(productId)
+
+    fun getProductDetails(productId: String): ProductDetails? = _productDetailsCache.value[productId]
+
+    fun refreshOwnership() {
+        if (billingClient?.isReady != true) return
+
+        queryPurchases(BillingClient.ProductType.INAPP) { purchases ->
+            handleInappPurchaseSnapshot(purchases)
         }
-        return INSTANCE;
-    }
 
-    private SpareChange(
-            Context context,
-            Set<String> consumableIds,
-            Set<String> oneTimeIds,
-            Set<String> subscriptionIds,
-            boolean autoAckNonConsumables,
-            boolean autoAckSubscriptions,
-            boolean autoConsumeConsumables
-    ) {
-        this.appContext = context;
-        this.consumableProductIds = Set.copyOf(consumableIds);
-        this.oneTimeProductIds = Set.copyOf(oneTimeIds);
-        this.subscriptionProductIds = Set.copyOf(subscriptionIds);
-        this.autoAcknowledgeNonConsumables = autoAckNonConsumables;
-        this.autoAcknowledgeSubscriptions = autoAckSubscriptions;
-        this.autoConsumeConsumables = autoConsumeConsumables;
-
-        this.pricePrefs = appContext.getSharedPreferences(
-                PREFS_NAME,
-                Context.MODE_PRIVATE
-        );
-
-        buildClient();
-    }
-
-    private void buildClient() {
-        billingClient = BillingClient.newBuilder(appContext)
-                .enablePendingPurchases(
-                        PendingPurchasesParams.newBuilder()
-                                .enableOneTimeProducts()
-                                .build()
-                )
-                .setListener(this)
-                .build();
-    }
-
-    public void addListener(@NonNull BillingEventListener listener) {
-        if (!listeners.contains(listener)) {
-            listeners.add(listener);
+        queryPurchases(BillingClient.ProductType.SUBS) { purchases ->
+            handleSubscriptionSnapshot(purchases)
         }
-        if (isReady()) {
-            listener.onBillingClientReady();
+    }
 
-            Map<String, ProductDetails> snapshot = getAllProductDetails();
-            if (!snapshot.isEmpty()) {
-                listener.onProductDetailsLoaded(snapshot);
+    private fun queryPurchases(productType: String, callback: (List<Purchase>) -> Unit) {
+        val params = QueryPurchasesParams.newBuilder().setProductType(productType).build()
+        billingClient?.queryPurchasesAsync(params) { result, purchases ->
+            if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                callback(purchases)
+            } else {
+                notifyBillingUnavailable(result)
             }
         }
     }
 
-    public void removeListener(@NonNull BillingEventListener listener) {
-        listeners.remove(listener);
-    }
+    fun refreshProductDetails() {
+        if (billingClient?.isReady != true) return
 
-    /** Start / restart connection to Play Billing. */
-    public void startConnection() {
-        if (billingClient.isReady()) {
-            isReady = true;
-            notifyBillingReady();
-            refreshOwnership();
-            refreshProductDetails();
-            return;
-        }
-
-        billingClient.startConnection(this);
-    }
-
-    public boolean isReady() {
-        return isReady && billingClient != null && billingClient.isReady();
-    }
-
-    /** Category lookup for a given productId. */
-    @NonNull
-    public ProductCategory getProductCategory(@NonNull String productId) {
-        if (consumableProductIds.contains(productId)) {
-            return ProductCategory.CONSUMABLE;
-        } else if (oneTimeProductIds.contains(productId)) {
-            return ProductCategory.ONE_TIME;
-        } else if (subscriptionProductIds.contains(productId)) {
-            return ProductCategory.SUBSCRIPTION;
-        } else {
-            return ProductCategory.UNKNOWN;
-        }
-    }
-
-    /** Non-consumable license check. */
-    public boolean isOneTimeProductOwned(@NonNull String productId) {
-        Boolean owned = ownedOneTimeProducts.get(productId);
-        return owned != null && owned;
-    }
-
-    /** Subscription active check. */
-    public boolean isSubscriptionActive(@NonNull String productId) {
-        Boolean active = activeSubscriptions.get(productId);
-        return active != null && active;
-    }
-
-    /** Check if a purchase for this product is currently pending (e.g., cash payment). */
-    public boolean isPurchasePending(@NonNull String productId) {
-        return pendingProductIds.contains(productId);
-    }
-
-    /** Get cached ProductDetails for a given productId, or null. */
-    @Nullable
-    public ProductDetails getProductDetails(@NonNull String productId) {
-        return productDetailsCache.get(productId);
-    }
-
-    /** Snapshot of all cached ProductDetails. */
-    @NonNull
-    public Map<String, ProductDetails> getAllProductDetails() {
-        return new HashMap<>(productDetailsCache);
-    }
-
-    /** Force refresh of owned products (INAPP and SUBS). */
-    public void refreshOwnership() {
-        if (!isReady()) return;
-
-        // INAPP (consumable + one-time)
-        QueryPurchasesParams inappParams = QueryPurchasesParams.newBuilder()
+        val products = mutableListOf<QueryProductDetailsParams.Product>()
+        
+        (consumableProductIds + oneTimeProductIds).forEach { id ->
+            products.add(QueryProductDetailsParams.Product.newBuilder()
+                .setProductId(id)
                 .setProductType(BillingClient.ProductType.INAPP)
-                .build();
-
-        billingClient.queryPurchasesAsync(inappParams, (billingResult, purchases) -> {
-            if (billingResult.getResponseCode() == BillingClient.BillingResponseCode.OK) {
-                handleInappPurchaseSnapshot(purchases);
-            } else {
-                notifyBillingUnavailable(billingResult);
-            }
-        });
-
-        // SUBS
-        QueryPurchasesParams subsParams = QueryPurchasesParams.newBuilder()
+                .build())
+        }
+        
+        subscriptionProductIds.forEach { id ->
+            products.add(QueryProductDetailsParams.Product.newBuilder()
+                .setProductId(id)
                 .setProductType(BillingClient.ProductType.SUBS)
-                .build();
-
-        billingClient.queryPurchasesAsync(subsParams, (billingResult, purchases) -> {
-            if (billingResult.getResponseCode() == BillingClient.BillingResponseCode.OK) {
-                handleSubscriptionSnapshot(purchases);
-            } else {
-                notifyBillingUnavailable(billingResult);
-            }
-        });
-    }
-
-    /** Force refresh ProductDetails for ALL configured SKUs. */
-    public void refreshProductDetails() {
-        if (!isReady()) return;
-
-        List<QueryProductDetailsParams.Product> products = new ArrayList<>();
-
-        for (String id : consumableProductIds) {
-            products.add(
-                    QueryProductDetailsParams.Product.newBuilder()
-                            .setProductId(id)
-                            .setProductType(BillingClient.ProductType.INAPP)
-                            .build()
-            );
-        }
-        for (String id : oneTimeProductIds) {
-            products.add(
-                    QueryProductDetailsParams.Product.newBuilder()
-                            .setProductId(id)
-                            .setProductType(BillingClient.ProductType.INAPP)
-                            .build()
-            );
-        }
-        for (String id : subscriptionProductIds) {
-            products.add(
-                    QueryProductDetailsParams.Product.newBuilder()
-                            .setProductId(id)
-                            .setProductType(BillingClient.ProductType.SUBS)
-                            .build()
-            );
+                .build())
         }
 
         if (products.isEmpty()) {
-            productDetailsCache.clear();
-            notifyProductDetailsLoaded();
-            return;
+            _productDetailsCache.value = emptyMap()
+            notifyProductDetailsLoaded()
+            return
         }
 
-        QueryProductDetailsParams params = QueryProductDetailsParams.newBuilder()
-                .setProductList(products)
-                .build();
-
-        billingClient.queryProductDetailsAsync(
-                params,
-                (billingResult, productDetailsResult) -> {
-                    if (billingResult.getResponseCode() == BillingClient.BillingResponseCode.OK) {
-                        List<ProductDetails> productDetailsList =
-                                productDetailsResult.getProductDetailsList();
-
-                        productDetailsCache.clear();
-                        for (ProductDetails pd : productDetailsList) {
-                            productDetailsCache.put(pd.getProductId(), pd);
-                        }
-
-                        // Detect price changes before notifying listeners
-                        detectPriceChanges(productDetailsCache);
-
-                        notifyProductDetailsLoaded();
-                    } else {
-                        notifyBillingUnavailable(billingResult);
-                    }
-                }
-        );
+        val params = QueryProductDetailsParams.newBuilder().setProductList(products).build()
+        billingClient?.queryProductDetailsAsync(params) { result, productDetailsResult ->
+            if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                val detailsList = productDetailsResult.productDetailsList ?: emptyList()
+                val newCache = detailsList.associateBy { it.productId }
+                
+                detectPriceChanges(newCache)
+                _productDetailsCache.value = newCache
+                notifyProductDetailsLoaded()
+            } else {
+                notifyBillingUnavailable(result)
+            }
+        }
     }
 
-    /**
-     * High-level: launch a purchase for a productId.
-     * Handles:
-     * - Consumable INAPP (no offer token)
-     * - One-time INAPP (no offer token)
-     * - SUBS (uses first available offer by default)
-     */
     @MainThread
-    @NonNull
-    public BillingResult launchPurchase(
-            @NonNull Activity activity,
-            @NonNull String productId
-    ) {
-        if (!isReady()) {
+    fun launchPurchase(
+        activity: Activity,
+        productId: String,
+        offerToken: String? = null
+    ): BillingResult {
+        val client = billingClient
+        if (client == null || !client.isReady) {
             return BillingResult.newBuilder()
-                    .setResponseCode(BillingClient.BillingResponseCode.SERVICE_DISCONNECTED)
-                    .setDebugMessage("BillingClient not ready")
-                    .build();
+                .setResponseCode(BillingClient.BillingResponseCode.SERVICE_DISCONNECTED)
+                .setDebugMessage("BillingClient not ready")
+                .build()
         }
 
         if (isLaunchingFlow) {
             return BillingResult.newBuilder()
-                    .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
-                    .setDebugMessage("A purchase flow is already in progress")
-                    .build();
+                .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
+                .setDebugMessage("A purchase flow is already in progress")
+                .build()
         }
 
-        // Prevent buying something already owned or pending
         if (isOneTimeProductOwned(productId) || isSubscriptionActive(productId)) {
             return BillingResult.newBuilder()
-                    .setResponseCode(BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED)
-                    .setDebugMessage("Product already owned: " + productId)
-                    .build();
+                .setResponseCode(BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED)
+                .setDebugMessage("Product already owned: $productId")
+                .build()
         }
 
         if (isPurchasePending(productId)) {
             return BillingResult.newBuilder()
-                    .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
-                    .setDebugMessage("Purchase is pending for " + productId)
-                    .build();
+                .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
+                .setDebugMessage("Purchase is pending for $productId")
+                .build()
         }
 
-        ProductDetails pd = getProductDetails(productId);
-        if (pd == null) {
-            return BillingResult.newBuilder()
-                    .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
-                    .setDebugMessage("ProductDetails not loaded for " + productId)
-                    .build();
+        val pd = getProductDetails(productId) ?: return BillingResult.newBuilder()
+            .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
+            .setDebugMessage("ProductDetails not loaded for $productId")
+            .build()
+
+        val productType = when (getProductCategory(productId)) {
+            ProductCategory.CONSUMABLE, ProductCategory.ONE_TIME -> BillingClient.ProductType.INAPP
+            ProductCategory.SUBSCRIPTION -> BillingClient.ProductType.SUBS
+            else -> return BillingResult.newBuilder()
+                .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
+                .setDebugMessage("Unknown product category for $productId")
+                .build()
         }
 
-        ProductCategory category = getProductCategory(productId);
-        String productType;
+        val pdParamsBuilder = BillingFlowParams.ProductDetailsParams.newBuilder().setProductDetails(pd)
 
-        switch (category) {
-            case CONSUMABLE:
-            case ONE_TIME:
-                productType = BillingClient.ProductType.INAPP;
-                break;
-            case SUBSCRIPTION:
-                productType = BillingClient.ProductType.SUBS;
-                break;
-            default:
+        if (productType == BillingClient.ProductType.SUBS) {
+            val token = offerToken ?: pd.subscriptionOfferDetails?.firstOrNull()?.offerToken
+            if (token == null) {
                 return BillingResult.newBuilder()
-                        .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
-                        .setDebugMessage("Unknown product category for " + productId)
-                        .build();
-        }
-
-        BillingFlowParams.ProductDetailsParams.Builder pdParamsBuilder =
-                BillingFlowParams.ProductDetailsParams.newBuilder()
-                        .setProductDetails(pd);
-
-        if (BillingClient.ProductType.SUBS.equals(productType)) {
-            // Simple default: pick the first subscription offer
-            List<ProductDetails.SubscriptionOfferDetails> offers =
-                    pd.getSubscriptionOfferDetails();
-            if (offers == null || offers.isEmpty()) {
-                return BillingResult.newBuilder()
-                        .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
-                        .setDebugMessage("No subscription offers for " + productId)
-                        .build();
+                    .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
+                    .setDebugMessage("No subscription offers for $productId")
+                    .build()
             }
-            String offerToken = offers.get(0).getOfferToken();
-            pdParamsBuilder.setOfferToken(offerToken);
+            pdParamsBuilder.setOfferToken(token)
         }
 
-        BillingFlowParams flowParams = BillingFlowParams.newBuilder()
-                .setProductDetailsParamsList(
-                        Collections.singletonList(pdParamsBuilder.build())
-                )
-                .build();
+        val flowParams = BillingFlowParams.newBuilder()
+            .setProductDetailsParamsList(listOf(pdParamsBuilder.build()))
+            .build()
 
-        isLaunchingFlow = true;
-        try {
-            return billingClient.launchBillingFlow(activity, flowParams);
+        isLaunchingFlow = true
+        return try {
+            client.launchBillingFlow(activity, flowParams)
         } finally {
-            isLaunchingFlow = false;
+            isLaunchingFlow = false
         }
     }
 
-    /** Explicit acknowledge helper if you want manual control. */
-    public void acknowledgePurchase(
-            @NonNull Purchase purchase,
-            @Nullable AcknowledgePurchaseResponseListener listener
-    ) {
-        if (!isReady()) return;
-        if (purchase.isAcknowledged()) return;
+    fun acknowledgePurchase(purchase: Purchase, listener: AcknowledgePurchaseResponseListener? = null) {
+        if (billingClient?.isReady != true || purchase.isAcknowledged) return
 
-        AcknowledgePurchaseParams params = AcknowledgePurchaseParams.newBuilder()
-                .setPurchaseToken(purchase.getPurchaseToken())
-                .build();
+        val params = AcknowledgePurchaseParams.newBuilder()
+            .setPurchaseToken(purchase.getPurchaseToken())
+            .build()
 
-        if (listener == null) {
-            listener = billingResult -> {
-                // no-op
-            };
-        }
-
-        billingClient.acknowledgePurchase(params, listener);
-    }
-
-    /** Explicit consume helper (if you disable auto-consume). */
-    public void consumePurchase(
-            @NonNull Purchase purchase,
-            @Nullable ConsumeResponseListener listener
-    ) {
-        if (!isReady()) return;
-
-        ConsumeParams params = ConsumeParams.newBuilder()
-                .setPurchaseToken(purchase.getPurchaseToken())
-                .build();
-
-        if (listener == null) {
-            listener = (billingResult, purchaseToken) -> {
-                // no-op
-            };
-        }
-
-        billingClient.consumeAsync(params, listener);
-    }
-
-    /** Optional helper to close client. */
-    public void endConnection() {
-        if (billingClient != null) {
-            billingClient.endConnection();
-        }
-        isReady = false;
-    }
-
-    @Override
-    public void onBillingSetupFinished(@NonNull BillingResult billingResult) {
-        if (billingResult.getResponseCode() == BillingClient.BillingResponseCode.OK) {
-            isReady = true;
-            notifyBillingReady();
-            refreshOwnership();
-            refreshProductDetails();
-        } else {
-            isReady = false;
-            notifyBillingUnavailable(billingResult);
-        }
-    }
-
-    @Override
-    public void onBillingServiceDisconnected() {
-        isReady = false;
-
-        new Handler(Looper.getMainLooper()).postDelayed(this::startConnection, 2000);
-
-
-        BillingResult result = BillingResult.newBuilder()
-                .setResponseCode(BillingClient.BillingResponseCode.SERVICE_DISCONNECTED)
-                .setDebugMessage("Service disconnected")
-                .build();
-        notifyBillingUnavailable(result);
-    }
-
-    @Override
-    public void onPurchasesUpdated(
-            @NonNull BillingResult billingResult,
-            @Nullable List<Purchase> purchases
-    ) {
-        // Notify app of raw update
-        for (BillingEventListener l : listeners) {
-            l.onPurchasesUpdated(billingResult, purchases);
-        }
-
-        if (billingResult.getResponseCode() == BillingClient.BillingResponseCode.OK && purchases != null) {
-            for (Purchase purchase : purchases) {
-                handleSinglePurchase(purchase);
-            }
-        } else if (billingResult.getResponseCode() == BillingClient.BillingResponseCode.USER_CANCELED) {
-            // user canceled – no special handling
-        } else {
-            notifyBillingUnavailable(billingResult);
-        }
-    }
-
-    private void handleInappPurchaseSnapshot(@NonNull List<Purchase> purchases) {
-        Map<String, Boolean> snapshotOneTime = new ConcurrentHashMap<>();
-        List<String> currentPending = new ArrayList<>();
-
-        for (Purchase purchase : purchases) {
-            if (purchase.getPurchaseState() == Purchase.PurchaseState.PENDING) {
-                currentPending.addAll(purchase.getProducts());
-                continue;
-            }
-            if (purchase.getPurchaseState() != Purchase.PurchaseState.PURCHASED) {
-                continue;
-            }
-
-            for (String productId : purchase.getProducts()) {
-                if (oneTimeProductIds.contains(productId)) {
-                    snapshotOneTime.put(productId, true);
+        billingClient?.acknowledgePurchase(params) { result ->
+            if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                purchase.products.forEach { productId ->
+                    listeners.forEach { it.onPurchaseAcknowledged(productId, result) }
                 }
             }
-        }
-
-        // Update pending set
-        for (String id : oneTimeProductIds) {
-            if (currentPending.contains(id)) {
-                pendingProductIds.add(id);
-            } else {
-                pendingProductIds.remove(id);
-            }
-        }
-
-        for (String id : oneTimeProductIds) {
-            boolean newOwned = Boolean.TRUE.equals(snapshotOneTime.getOrDefault(id, false));
-            boolean oldOwned = Boolean.TRUE.equals(ownedOneTimeProducts.getOrDefault(id, false));
-            if (newOwned != oldOwned) {
-                ownedOneTimeProducts.put(id, newOwned);
-                notifyOneTimeOwnershipChanged(id, newOwned);
-            }
+            listener?.onAcknowledgePurchaseResponse(result)
         }
     }
 
-    private void handleSubscriptionSnapshot(@NonNull List<Purchase> purchases) {
-        Map<String, Boolean> snapshotSubs = new ConcurrentHashMap<>();
-        List<String> currentPending = new ArrayList<>();
+    fun consumePurchase(purchase: Purchase, listener: ConsumeResponseListener? = null) {
+        if (billingClient?.isReady != true) return
 
-        for (Purchase purchase : purchases) {
-            if (purchase.getPurchaseState() == Purchase.PurchaseState.PENDING) {
-                currentPending.addAll(purchase.getProducts());
-                continue;
-            }
-            if (purchase.getPurchaseState() != Purchase.PurchaseState.PURCHASED) {
-                continue;
-            }
+        val params = ConsumeParams.newBuilder()
+            .setPurchaseToken(purchase.getPurchaseToken())
+            .build()
 
-            for (String productId : purchase.getProducts()) {
-                if (subscriptionProductIds.contains(productId)) {
-                    snapshotSubs.put(productId, true);
+        billingClient?.consumeAsync(params) { result, token ->
+            if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                purchase.products.forEach { productId ->
+                    listeners.forEach { it.onPurchaseConsumed(productId, result) }
                 }
             }
-        }
-
-        // Update pending set
-        for (String id : subscriptionProductIds) {
-            if (currentPending.contains(id)) {
-                pendingProductIds.add(id);
-            } else {
-                pendingProductIds.remove(id);
-            }
-        }
-
-        for (String id : subscriptionProductIds) {
-            boolean newActive = Boolean.TRUE.equals(snapshotSubs.getOrDefault(id, false));
-            boolean oldActive = Boolean.TRUE.equals(activeSubscriptions.getOrDefault(id, false));
-            if (newActive != oldActive) {
-                activeSubscriptions.put(id, newActive);
-                notifySubscriptionOwnershipChanged(id, newActive);
-            }
+            listener?.onConsumeResponse(result, token)
         }
     }
 
-    private void handleSinglePurchase(@NonNull Purchase purchase) {
-        List<String> productIds = purchase.getProducts();
-        if (productIds == null || productIds.isEmpty()) return;
+    fun endConnection() {
+        billingClient?.endConnection()
+        _isReady.value = false
+    }
 
-        if (purchase.getPurchaseState() == Purchase.PurchaseState.PENDING) {
-            pendingProductIds.addAll(productIds);
-            return;
+    override fun onBillingSetupFinished(billingResult: BillingResult) {
+        if (billingResult.responseCode == BillingClient.BillingResponseCode.OK) {
+            _isReady.value = true
+            reconnectRetryCount = 0
+            notifyBillingReady()
+            refreshOwnership()
+            refreshProductDetails()
+        } else {
+            _isReady.value = false
+            notifyBillingUnavailable(billingResult)
         }
+    }
 
-        if (purchase.getPurchaseState() != Purchase.PurchaseState.PURCHASED) {
-            // If it was pending and now it's canceled/expired, remove it
-            pendingProductIds.removeAll(productIds);
-            return;
+    override fun onBillingServiceDisconnected() {
+        _isReady.value = false
+        notifyBillingUnavailable(BillingResult.newBuilder()
+            .setResponseCode(BillingClient.BillingResponseCode.SERVICE_DISCONNECTED)
+            .setDebugMessage("Service disconnected")
+            .build())
+        
+        // Exponential backoff for reconnection
+        val delay = (2.0.pow(reconnectRetryCount.toDouble()) * 1000).toLong().coerceAtMost(MAX_RECONNECT_DELAY_MS)
+        reconnectRetryCount++
+        
+        scope.launch {
+            delay(delay)
+            startConnection()
         }
+    }
 
-        // It is PURCHASED - ensure it is removed from pending
-        pendingProductIds.removeAll(productIds);
+    override fun onPurchasesUpdated(billingResult: BillingResult, purchases: List<Purchase>?) {
+        listeners.forEach { it.onPurchasesUpdated(billingResult, purchases) }
 
-        String firstId = productIds.get(0);
-        ProductCategory category = getProductCategory(firstId);
+        if (billingResult.responseCode == BillingClient.BillingResponseCode.OK && purchases != null) {
+            purchases.forEach { handleSinglePurchase(it) }
+        } else if (billingResult.responseCode != BillingClient.BillingResponseCode.USER_CANCELED) {
+            notifyBillingUnavailable(billingResult)
+        }
+    }
 
-        switch (category) {
-            case ONE_TIME:
-                for (String productId : productIds) {
-                    if (!oneTimeProductIds.contains(productId)) continue;
-                    Boolean prev = ownedOneTimeProducts.put(productId, true);
-                    if (prev == null || !prev) {
-                        notifyOneTimeOwnershipChanged(productId, true);
+    private fun handleInappPurchaseSnapshot(purchases: List<Purchase>) {
+        val snapshotOneTime = mutableMapOf<String, Boolean>()
+        val currentPending = mutableSetOf<String>()
+
+        purchases.forEach { purchase ->
+            if (purchase.purchaseState == Purchase.PurchaseState.PENDING) {
+                currentPending.addAll(purchase.products)
+            } else if (purchase.purchaseState == Purchase.PurchaseState.PURCHASED) {
+                purchase.products.forEach { id ->
+                    if (oneTimeProductIds.contains(id)) {
+                        snapshotOneTime[id] = true
                     }
                 }
-                if (autoAcknowledgeNonConsumables && !purchase.isAcknowledged()) {
-                    acknowledgePurchase(purchase, null);
-                }
-                break;
+            }
+        }
 
-            case CONSUMABLE:
+        _pendingProductIds.update { it + currentPending }
+        
+        oneTimeProductIds.forEach { id ->
+            val isOwned = snapshotOneTime[id] == true
+            val wasOwned = _ownedOneTimeProducts.value[id] == true
+            if (isOwned != wasOwned) {
+                _ownedOneTimeProducts.update { it + (id to isOwned) }
+                notifyOneTimeOwnershipChanged(id, isOwned)
+            }
+        }
+    }
+
+    private fun handleSubscriptionSnapshot(purchases: List<Purchase>) {
+        val snapshotSubs = mutableMapOf<String, SubscriptionStatus>()
+        val currentPending = mutableSetOf<String>()
+
+        purchases.forEach { purchase ->
+            if (purchase.purchaseState == Purchase.PurchaseState.PENDING) {
+                currentPending.addAll(purchase.products)
+            } else if (purchase.purchaseState == Purchase.PurchaseState.PURCHASED) {
+                purchase.products.forEach { id ->
+                    if (subscriptionProductIds.contains(id)) {
+                        snapshotSubs[id] = SubscriptionStatus(
+                            productId = id,
+                            isActive = true,
+                            isAutoRenewing = purchase.isAutoRenewing,
+                            purchaseToken = purchase.purchaseToken,
+                            purchaseTime = purchase.purchaseTime
+                        )
+                    }
+                }
+            }
+        }
+
+        _pendingProductIds.update { it + currentPending }
+
+        subscriptionProductIds.forEach { id ->
+            val newStatus = snapshotSubs[id]
+            val oldStatus = _activeSubscriptions.value[id]
+            
+            if (newStatus != oldStatus) {
+                _activeSubscriptions.update { it + (id to (newStatus ?: SubscriptionStatus(id, false, false, "", 0L))) }
+                notifySubscriptionOwnershipChanged(id, newStatus?.isActive == true)
+            }
+        }
+    }
+
+    private fun handleSinglePurchase(purchase: Purchase) {
+        val productIds = purchase.products
+        if (productIds.isEmpty()) return
+
+        if (purchase.purchaseState == Purchase.PurchaseState.PENDING) {
+            _pendingProductIds.update { it + productIds }
+            return
+        }
+
+        _pendingProductIds.update { it - productIds.toSet() }
+
+        if (purchase.purchaseState != Purchase.PurchaseState.PURCHASED) return
+
+        val firstId = productIds[0]
+        when (getProductCategory(firstId)) {
+            ProductCategory.ONE_TIME -> {
+                productIds.filter { oneTimeProductIds.contains(it) }.forEach { id ->
+                    if (_ownedOneTimeProducts.value[id] != true) {
+                        _ownedOneTimeProducts.update { it + (id to true) }
+                        notifyOneTimeOwnershipChanged(id, true)
+                    }
+                }
+                if (autoAcknowledgeNonConsumables && !purchase.isAcknowledged) {
+                    acknowledgePurchase(purchase)
+                }
+            }
+            ProductCategory.CONSUMABLE -> {
                 if (autoConsumeConsumables) {
-                    consumePurchase(purchase, null);
+                    consumePurchase(purchase)
                 }
-                break;
-
-            case SUBSCRIPTION:
-                for (String productId : productIds) {
-                    if (!subscriptionProductIds.contains(productId)) continue;
-                    Boolean prev = activeSubscriptions.put(productId, true);
-                    if (prev == null || !prev) {
-                        notifySubscriptionOwnershipChanged(productId, true);
+            }
+            ProductCategory.SUBSCRIPTION -> {
+                productIds.filter { subscriptionProductIds.contains(it) }.forEach { id ->
+                    val oldStatus = _activeSubscriptions.value[id]
+                    if (oldStatus?.isActive != true) {
+                        _activeSubscriptions.update { it + (id to SubscriptionStatus(
+                            productId = id,
+                            isActive = true,
+                            isAutoRenewing = purchase.isAutoRenewing,
+                            purchaseToken = purchase.purchaseToken,
+                            purchaseTime = purchase.purchaseTime
+                        )) }
+                        notifySubscriptionOwnershipChanged(id, true)
                     }
                 }
-                if (autoAcknowledgeSubscriptions && !purchase.isAcknowledged()) {
-                    acknowledgePurchase(purchase, null);
+                if (autoAcknowledgeSubscriptions && !purchase.isAcknowledged) {
+                    acknowledgePurchase(purchase)
                 }
-                break;
-
-            case UNKNOWN:
-            default:
-                // Not registered in our config
-                break;
-        }
-    }
-
-    /**
-     * Extract price info (micros + currency) from ProductDetails.
-     * Handles INAPP (one-time/consumable) and SUBS (first pricing phase).
-     */
-    @Nullable
-    private PriceInfo extractPriceInfo(@NonNull ProductDetails pd) {
-        // INAPP (one-time / consumable)
-        ProductDetails.OneTimePurchaseOfferDetails oneTime =
-                pd.getOneTimePurchaseOfferDetails();
-        if (oneTime != null) {
-            long micros = oneTime.getPriceAmountMicros();
-            String currency = oneTime.getPriceCurrencyCode();
-            if (currency == null) currency = "";
-            return new PriceInfo(micros, currency);
-        }
-
-        // SUBS – take first pricing phase of first offer as the "current" price
-        List<ProductDetails.SubscriptionOfferDetails> offers =
-                pd.getSubscriptionOfferDetails();
-        if (offers != null && !offers.isEmpty()) {
-            ProductDetails.SubscriptionOfferDetails offer = offers.get(0);
-            if (offer.getPricingPhases() != null &&
-                    offer.getPricingPhases().getPricingPhaseList() != null &&
-                    !offer.getPricingPhases().getPricingPhaseList().isEmpty()) {
-
-                ProductDetails.PricingPhase phase =
-                        offer.getPricingPhases().getPricingPhaseList().get(0);
-
-                long micros = phase.getPriceAmountMicros();
-                String currency = phase.getPriceCurrencyCode();
-                if (currency == null) currency = "";
-                return new PriceInfo(micros, currency);
             }
+            else -> {}
         }
-
-        return null;
     }
 
-    @Nullable
-    private PriceInfo loadStoredPrice(@NonNull String productId) {
-        long micros = pricePrefs.getLong(
-                KEY_PRICE_MICROS_PREFIX + productId,
-                Long.MIN_VALUE
-        );
-        if (micros == Long.MIN_VALUE) {
-            return null; // no stored price yet
+    private fun extractPriceInfo(pd: ProductDetails): PriceInfo? {
+        pd.oneTimePurchaseOfferDetails?.let {
+            return PriceInfo(it.priceAmountMicros, it.priceCurrencyCode ?: "")
         }
-        String currency = pricePrefs.getString(
-                KEY_PRICE_CURRENCY_PREFIX + productId,
-                ""
-        );
-        if (currency == null) currency = "";
-        return new PriceInfo(micros, currency);
+        pd.subscriptionOfferDetails?.firstOrNull()?.pricingPhases?.pricingPhaseList?.firstOrNull()?.let {
+            return PriceInfo(it.priceAmountMicros, it.priceCurrencyCode ?: "")
+        }
+        return null
     }
 
-    private void storePrice(@NonNull String productId, @NonNull PriceInfo info) {
+    private fun loadStoredPrice(productId: String): PriceInfo? {
+        val micros = pricePrefs.getLong(KEY_PRICE_MICROS_PREFIX + productId, Long.MIN_VALUE)
+        if (micros == Long.MIN_VALUE) return null
+        val currency = pricePrefs.getString(KEY_PRICE_CURRENCY_PREFIX + productId, "") ?: ""
+        return PriceInfo(micros, currency)
+    }
+
+    private fun storePrice(productId: String, info: PriceInfo) {
         pricePrefs.edit()
-                .putLong(KEY_PRICE_MICROS_PREFIX + productId, info.priceMicros())
-                .putString(KEY_PRICE_CURRENCY_PREFIX + productId, info.currencyCode())
-                .apply();
+            .putLong(KEY_PRICE_MICROS_PREFIX + productId, info.priceMicros)
+            .putString(KEY_PRICE_CURRENCY_PREFIX + productId, info.currencyCode)
+            .apply()
     }
 
-    /**
-     * Compare current ProductDetails prices against stored values and
-     * fire onProductPriceChanged for any SKUs that differ.
-     */
-    private void detectPriceChanges(@NonNull Map<String, ProductDetails> latestDetails) {
-        for (Map.Entry<String, ProductDetails> entry : latestDetails.entrySet()) {
-            String productId = entry.getKey();
-            ProductDetails pd = entry.getValue();
+    private fun detectPriceChanges(latestDetails: Map<String, ProductDetails>) {
+        latestDetails.forEach { (productId, pd) ->
+            val newInfo = extractPriceInfo(pd) ?: return@forEach
+            val oldInfo = loadStoredPrice(productId)
 
-            PriceInfo newInfo = extractPriceInfo(pd);
-            if (newInfo == null) {
-                continue; // no price info, ignore
-            }
-
-            PriceInfo oldInfo = loadStoredPrice(productId);
             if (oldInfo == null) {
-                // First time seeing this price; store and move on
-                storePrice(productId, newInfo);
-                continue;
+                storePrice(productId, newInfo)
+                return@forEach
             }
 
-            boolean priceChanged =
-                    (oldInfo.priceMicros() != newInfo.priceMicros()) ||
-                            !oldInfo.currencyCode().equals(newInfo.currencyCode());
-
-            if (priceChanged) {
-                for (BillingEventListener l : listeners) {
-                    l.onProductPriceChanged(
-                            productId,
-                            oldInfo.priceMicros(),
-                            oldInfo.currencyCode(),
-                            newInfo.priceMicros(),
-                            newInfo.currencyCode()
-                    );
+            if (oldInfo.priceMicros != newInfo.priceMicros || oldInfo.currencyCode != newInfo.currencyCode) {
+                listeners.forEach {
+                    it.onProductPriceChanged(
+                        productId, oldInfo.priceMicros, oldInfo.currencyCode,
+                        newInfo.priceMicros, newInfo.currencyCode
+                    )
                 }
-                storePrice(productId, newInfo);
+                storePrice(productId, newInfo)
             }
         }
     }
 
-    private void notifyBillingReady() {
-        for (BillingEventListener l : listeners) {
-            l.onBillingClientReady();
-        }
-    }
-
-    private void notifyBillingUnavailable(@NonNull BillingResult result) {
-        for (BillingEventListener l : listeners) {
-            l.onBillingClientUnavailable(result);
-        }
-    }
-
-    private void notifyOneTimeOwnershipChanged(@NonNull String productId, boolean isOwned) {
-        for (BillingEventListener l : listeners) {
-            l.onOneTimeProductOwnershipChanged(productId, isOwned);
-        }
-    }
-
-    private void notifySubscriptionOwnershipChanged(@NonNull String productId, boolean isActive) {
-        for (BillingEventListener l : listeners) {
-            l.onSubscriptionOwnershipChanged(productId, isActive);
-        }
-    }
-
-    private void notifyProductDetailsLoaded() {
-        Map<String, ProductDetails> copy = getAllProductDetails();
-        for (BillingEventListener l : listeners) {
-            l.onProductDetailsLoaded(copy);
-        }
-    }
-
-    public static boolean isProbablyPlayServicesOrAccountIssue(@NonNull BillingResult result) {
-        return switch (result.getResponseCode()) {
-            case BillingClient.BillingResponseCode.SERVICE_UNAVAILABLE, BillingClient.BillingResponseCode.BILLING_UNAVAILABLE,
-                 BillingClient.BillingResponseCode.SERVICE_DISCONNECTED, BillingClient.BillingResponseCode.ERROR -> true;
-            default -> false;
-        };
-    }
-
+    private fun notifyBillingReady() = listeners.forEach { it.onBillingClientReady() }
+    private fun notifyBillingUnavailable(result: BillingResult) = listeners.forEach { it.onBillingClientUnavailable(result) }
+    private fun notifyOneTimeOwnershipChanged(id: String, owned: Boolean) = listeners.forEach { it.onOneTimeProductOwnershipChanged(id, owned) }
+    private fun notifySubscriptionOwnershipChanged(id: String, active: Boolean) = listeners.forEach { it.onSubscriptionOwnershipChanged(id, active) }
+    private fun notifyProductDetailsLoaded() = listeners.forEach { it.onProductDetailsLoaded(_productDetailsCache.value) }
 }

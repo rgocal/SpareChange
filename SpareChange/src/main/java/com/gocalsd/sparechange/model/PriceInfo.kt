@@ -1,5 +1,3 @@
-package com.gocalsd.sparechange.model;
+package com.gocalsd.sparechange.model
 
-public record PriceInfo(long priceMicros, String currencyCode) {
-}
-
+data class PriceInfo(val priceMicros: Long, val currencyCode: String)

@@ -1,9 +1,8 @@
-package com.gocalsd.sparechange.model;
+package com.gocalsd.sparechange.model
 
-public enum ProductCategory {
+enum class ProductCategory {
     CONSUMABLE,
     ONE_TIME,
     SUBSCRIPTION,
     UNKNOWN
 }
-

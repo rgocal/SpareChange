@@ -6,7 +6,7 @@ plugins {
 android {
     namespace = "com.gocalsd.sparechange.demo"
     compileSdk {
-        version = release(36) {
+        version = release(37) {
             minorApiLevel = 1
         }
     }
@@ -14,7 +14,7 @@ android {
     defaultConfig {
         applicationId = "com.gocalsd.sparechange"
         minSdk = 29
-        targetSdk = 36
+        targetSdk = 37
         versionCode = 1
         versionName = "1.01"
     }
@@ -39,4 +39,9 @@ android {
 
 dependencies {
     implementation(project(":SpareChange"))
+    implementation(libs.lifecycle.runtime.ktx)
+    implementation(libs.lifecycle.process)
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.ui)
+    implementation(libs.compose.runtime)
 }
