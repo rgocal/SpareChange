@@ -22,7 +22,7 @@ Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("com.github.rgocal:SpareChange:1.0.3")
+    implementation("com.github.rgocal:SpareChange:1.0.4")
 }
 ```
 

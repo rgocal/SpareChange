@@ -16,7 +16,6 @@ import com.gocalsd.sparechange.model.SubscriptionStatus
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlin.coroutines.resume
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.pow
 
@@ -363,7 +362,7 @@ class SpareChange private constructor(
         if (billingClient?.isReady != true || purchase.isAcknowledged) return
 
         val params = AcknowledgePurchaseParams.newBuilder()
-            .setPurchaseToken(purchase.getPurchaseToken())
+            .setPurchaseToken(purchase.purchaseToken)
             .build()
 
         billingClient?.acknowledgePurchase(params) { result ->
@@ -380,7 +379,7 @@ class SpareChange private constructor(
         if (billingClient?.isReady != true) return
 
         val params = ConsumeParams.newBuilder()
-            .setPurchaseToken(purchase.getPurchaseToken())
+            .setPurchaseToken(purchase.purchaseToken)
             .build()
 
         billingClient?.consumeAsync(params) { result, token ->
