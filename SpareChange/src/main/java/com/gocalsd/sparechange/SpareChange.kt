@@ -15,6 +15,7 @@ import com.gocalsd.sparechange.model.ProductCategory
 import com.gocalsd.sparechange.model.SubscriptionStatus
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
+import kotlin.coroutines.resume
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.math.pow
@@ -198,48 +199,84 @@ class SpareChange private constructor(
     fun refreshProductDetails() {
         if (billingClient?.isReady != true) return
 
-        val products = mutableListOf<QueryProductDetailsParams.Product>()
-        
-        (consumableProductIds + oneTimeProductIds).forEach { id ->
-            products.add(QueryProductDetailsParams.Product.newBuilder()
-                .setProductId(id)
-                .setProductType(BillingClient.ProductType.INAPP)
-                .build())
-        }
-        
-        subscriptionProductIds.forEach { id ->
-            products.add(QueryProductDetailsParams.Product.newBuilder()
-                .setProductId(id)
-                .setProductType(BillingClient.ProductType.SUBS)
-                .build())
-        }
+        scope.launch {
+            val inAppProducts = (consumableProductIds + oneTimeProductIds).map { id ->
+                QueryProductDetailsParams.Product.newBuilder()
+                    .setProductId(id)
+                    .setProductType(BillingClient.ProductType.INAPP)
+                    .build()
+            }
 
-        if (products.isEmpty()) {
-            _productDetailsCache.value = emptyMap()
-            notifyProductDetailsLoaded()
-            return
-        }
+            val subProducts = subscriptionProductIds.map { id ->
+                QueryProductDetailsParams.Product.newBuilder()
+                    .setProductId(id)
+                    .setProductType(BillingClient.ProductType.SUBS)
+                    .build()
+            }
 
-        val params = QueryProductDetailsParams.newBuilder().setProductList(products).build()
-        billingClient?.queryProductDetailsAsync(params) { result, productDetailsResult ->
-            if (result.responseCode == BillingClient.BillingResponseCode.OK) {
-                val detailsList = productDetailsResult.productDetailsList ?: emptyList()
-                val newCache = detailsList.associateBy { it.productId }
-                
-                detectPriceChanges(newCache)
-                _productDetailsCache.value = newCache
+            val results = mutableMapOf<String, ProductDetails>()
+            
+            // Query IN-APP products
+            if (inAppProducts.isNotEmpty()) {
+                val inAppResults = queryProductDetails(BillingClient.ProductType.INAPP, inAppProducts)
+                results.putAll(inAppResults)
+            }
+
+            // Query SUBSCRIPTION products
+            if (subProducts.isNotEmpty()) {
+                val subResults = queryProductDetails(BillingClient.ProductType.SUBS, subProducts)
+                results.putAll(subResults)
+            }
+
+            if (inAppProducts.isEmpty() && subProducts.isEmpty()) {
+                _productDetailsCache.value = emptyMap()
                 notifyProductDetailsLoaded()
             } else {
-                notifyBillingUnavailable(result)
+                detectPriceChanges(results)
+                _productDetailsCache.value = results
+                notifyProductDetailsLoaded()
             }
         }
     }
 
+    private suspend fun queryProductDetails(
+        productType: String,
+        products: List<QueryProductDetailsParams.Product>
+    ): Map<String, ProductDetails> = suspendCancellableCoroutine { continuation ->
+        try {
+            val params = QueryProductDetailsParams.newBuilder()
+                .setProductList(products)
+                .build()
+
+            billingClient?.queryProductDetailsAsync(params) { result, productDetailsResult ->
+                if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                    val detailsList = productDetailsResult.productDetailsList
+                    continuation.resume(detailsList.associateBy { it.productId })
+                } else {
+                    notifyBillingUnavailable(result)
+                    continuation.resume(emptyMap())
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error building QueryProductDetailsParams for $productType", e)
+            continuation.resume(emptyMap())
+        }
+    }
+
+    /**
+     * High-level: launch a purchase for a productId.
+     *
+     * @param activity The current activity.
+     * @param productId The ID of the product to purchase.
+     * @param offerToken Optional: The specific offer token for a subscription. If null, the first available offer is used.
+     * @param subscriptionUpdateParams Optional: Parameters for upgrading/downgrading an existing subscription.
+     */
     @MainThread
     fun launchPurchase(
         activity: Activity,
         productId: String,
-        offerToken: String? = null
+        offerToken: String? = null,
+        subscriptionUpdateParams: BillingFlowParams.SubscriptionUpdateParams? = null
     ): BillingResult {
         val client = billingClient
         if (client == null || !client.isReady) {
@@ -256,10 +293,20 @@ class SpareChange private constructor(
                 .build()
         }
 
-        if (isOneTimeProductOwned(productId) || isSubscriptionActive(productId)) {
+        // Check if already owned
+        if (isOneTimeProductOwned(productId)) {
             return BillingResult.newBuilder()
                 .setResponseCode(BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED)
-                .setDebugMessage("Product already owned: $productId")
+                .setDebugMessage("One-time product already owned: $productId")
+                .build()
+        }
+        
+        // Note: For subscriptions, we might be upgrading/downgrading, so we don't block
+        // if it's already active UNLESS it's the exact same ID and we're not updating.
+        if (isSubscriptionActive(productId) && subscriptionUpdateParams == null) {
+            return BillingResult.newBuilder()
+                .setResponseCode(BillingClient.BillingResponseCode.ITEM_ALREADY_OWNED)
+                .setDebugMessage("Subscription already active: $productId")
                 .build()
         }
 
@@ -275,35 +322,38 @@ class SpareChange private constructor(
             .setDebugMessage("ProductDetails not loaded for $productId")
             .build()
 
-        val productType = when (getProductCategory(productId)) {
-            ProductCategory.CONSUMABLE, ProductCategory.ONE_TIME -> BillingClient.ProductType.INAPP
-            ProductCategory.SUBSCRIPTION -> BillingClient.ProductType.SUBS
-            else -> return BillingResult.newBuilder()
-                .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
-                .setDebugMessage("Unknown product category for $productId")
-                .build()
+        // Use the product type reported by Google, not our internal category
+        val actualProductType = pd.productType
+        
+        // Validate against our config for consistency (optional warning)
+        val expectedCategory = getProductCategory(productId)
+        if (actualProductType == BillingClient.ProductType.SUBS && expectedCategory != ProductCategory.SUBSCRIPTION) {
+            Log.w(TAG, "Product $productId is a Subscription in Play Console, but categorized as $expectedCategory in SpareChange.")
         }
 
         val pdParamsBuilder = BillingFlowParams.ProductDetailsParams.newBuilder().setProductDetails(pd)
 
-        if (productType == BillingClient.ProductType.SUBS) {
+        if (actualProductType == BillingClient.ProductType.SUBS) {
             val token = offerToken ?: pd.subscriptionOfferDetails?.firstOrNull()?.offerToken
             if (token == null) {
                 return BillingResult.newBuilder()
                     .setResponseCode(BillingClient.BillingResponseCode.DEVELOPER_ERROR)
-                    .setDebugMessage("No subscription offers for $productId")
+                    .setDebugMessage("No subscription offers found for $productId")
                     .build()
             }
             pdParamsBuilder.setOfferToken(token)
         }
 
-        val flowParams = BillingFlowParams.newBuilder()
+        val flowParamsBuilder = BillingFlowParams.newBuilder()
             .setProductDetailsParamsList(listOf(pdParamsBuilder.build()))
-            .build()
+
+        if (subscriptionUpdateParams != null) {
+            flowParamsBuilder.setSubscriptionUpdateParams(subscriptionUpdateParams)
+        }
 
         isLaunchingFlow = true
         return try {
-            client.launchBillingFlow(activity, flowParams)
+            client.launchBillingFlow(activity, flowParamsBuilder.build())
         } finally {
             isLaunchingFlow = false
         }

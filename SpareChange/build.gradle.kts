@@ -42,7 +42,7 @@ afterEvaluate {
                 
                 groupId = "com.github.rgocal"
                 artifactId = "SpareChange"
-                version = "1.0.3"
+                version = "1.0.4"
             }
         }
     }

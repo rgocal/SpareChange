@@ -110,8 +110,18 @@ SpareChange provides deep insight into subscription states via the `Subscription
 val status = spareChange.getSubscriptionStatus("premium_monthly")
 if (status?.isActive == true && !status.isAutoRenewing) {
     // User has canceled but still has time left. 
-    // Perfect time to show a "Retention" offer!
 }
+```
+
+**Subscription Upgrades/Downgrades**
+To change an existing subscription, use `SubscriptionUpdateParams`:
+```kotlin
+val updateParams = BillingFlowParams.SubscriptionUpdateParams.newBuilder()
+    .setOldPurchaseToken(oldToken)
+    .setSubscriptionReplacementMode(BillingFlowParams.SubscriptionUpdateParams.ReplacementMode.CHARGE_PRORATED_PRICE)
+    .build()
+
+spareChange.launchPurchase(activity, "premium_yearly", subscriptionUpdateParams = updateParams)
 ```
 
 ---

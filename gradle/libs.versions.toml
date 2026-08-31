@@ -4,8 +4,8 @@ agp = "9.3.2"
 kotlin = "2.4.10"
 coroutines = "1.11.0"
 lifecycle = "2.11.0"
-compose-bom = "2025.02.00"
-
+compose-bom = "2026.08.00"
+activity-compose = "1.13.0"
 billing = "9.1.0"
 
 [libraries]
@@ -17,6 +17,9 @@ lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", v
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "compose-bom" }
 compose-ui = { group = "androidx.compose.ui", name = "ui" }
 compose-runtime = { group = "androidx.compose.runtime", name = "runtime" }
+compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+compose-icons-core = { group = "androidx.compose.material", name = "material-icons-core" }
+activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activity-compose" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
